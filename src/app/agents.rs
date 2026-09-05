@@ -374,6 +374,11 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
+        let input_submission_token = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .map(crate::terminal::TerminalRuntime::input_submission_token)
+            .unwrap_or_default();
         let pane = self.pane_info(ws_idx, pane_id)?;
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
@@ -398,6 +403,7 @@ impl App {
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
+            input_submission_token,
         })
     }
 

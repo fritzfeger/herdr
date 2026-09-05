@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPromptIfParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
+    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -64,10 +64,16 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
+        let queued = match request.method {
+            crate::api::schema::Method::AgentPrompt(params) => {
+                self.queue_agent_prompt(request.id, params)
+            }
+            crate::api::schema::Method::AgentPromptIf(params) => {
+                self.queue_agent_prompt_if(request.id, params)
+            }
+            _ => return false,
         };
-        match self.queue_agent_prompt(request.id, params) {
+        match queued {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
@@ -163,9 +169,6 @@ impl App {
         }
         let (text, enter) =
             crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
-        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
-            return Err(agent_not_found(id, &params.target));
-        };
         let completion = runtime
             .queue_user_input_submission(
                 Bytes::from(text),
@@ -173,6 +176,173 @@ impl App {
                 AGENT_PROMPT_SUBMIT_DELAY,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found(id, &params.target));
+        };
+        Ok((id, agent, completion))
+    }
+
+    /// Resolve, compare, and queue while the app event loop exclusively handles
+    /// this request. The runtime token gate also excludes concurrent input from
+    /// attached clients between the final token comparison and queue acceptance.
+    fn queue_agent_prompt_if(
+        &mut self,
+        id: String,
+        params: AgentPromptIfParams,
+    ) -> Result<
+        (
+            String,
+            crate::api::schema::AgentInfo,
+            std::sync::mpsc::Receiver<std::io::Result<()>>,
+        ),
+        String,
+    > {
+        if params.text.is_empty() {
+            return Err(encode_error(
+                id,
+                "empty_agent_prompt",
+                "agent prompt must not be empty",
+            ));
+        }
+        if params.expected.agent != "pi"
+            || params.expected.agent_session.source != "herdr:pi"
+            || params.expected.agent_session.agent != "pi"
+        {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "expected binding is not a native Pi session",
+            ));
+        }
+        let resolved = match self.resolve_named_agent_target(&params.name) {
+            Ok(resolved) => resolved,
+            Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
+        };
+        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found(id, &params.name));
+        };
+        if agent.terminal_id != params.expected.terminal_id {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "terminal binding changed",
+            ));
+        }
+        if agent.agent.as_deref() != Some(params.expected.agent.as_str()) {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "native agent kind changed",
+            ));
+        }
+        if agent.agent_session.as_ref() != Some(&params.expected.agent_session) {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "native agent session changed",
+            ));
+        }
+        if agent.revision != params.expected.revision {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "revision is stale",
+            ));
+        }
+        if agent.state_change_seq != params.expected.state_change_seq {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "agent lifecycle version is stale",
+            ));
+        }
+        if agent.input_submission_token != params.expected.input_submission_token {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "input submission token is stale",
+            ));
+        }
+        if !matches!(
+            agent.agent_status,
+            crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
+        ) {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "agent is not idle or done",
+            ));
+        }
+        if agent.launch_pending {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "agent launch is pending",
+            ));
+        }
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
+        else {
+            return Err(agent_not_found(id, &params.name));
+        };
+        let Some(expected_agent) = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.effective_known_agent())
+        else {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "agent is not ready",
+            ));
+        };
+        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found(id, &params.name));
+        };
+        if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+            return Err(agent_prompt_precondition_failed(
+                id,
+                &params.name,
+                "agent no longer owns the pane foreground process",
+            ));
+        }
+        let (text, enter) =
+            crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
+        let completion = match runtime.queue_user_input_submission_if(
+            params.expected.input_submission_token,
+            Bytes::from(text),
+            Bytes::from(enter),
+            AGENT_PROMPT_SUBMIT_DELAY,
+        ) {
+            Ok(completion) => completion,
+            Err(crate::terminal::ConditionalInputError::TokenMismatch) => {
+                return Err(agent_prompt_precondition_failed(
+                    id,
+                    &params.name,
+                    "input submission token is stale",
+                ));
+            }
+            Err(crate::terminal::ConditionalInputError::TokenExhausted) => {
+                return Err(agent_prompt_precondition_failed(
+                    id,
+                    &params.name,
+                    "input submission token is exhausted",
+                ));
+            }
+            Err(crate::terminal::ConditionalInputError::Send(err)) => {
+                return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
+            }
+        };
+
+        self.emit_pane_updated(resolved.ws_idx, resolved.pane_id);
+        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found(id, &params.name));
+        };
         Ok((id, agent, completion))
     }
 
@@ -334,6 +504,14 @@ impl App {
     }
 }
 
+fn agent_prompt_precondition_failed(id: String, name: &str, reason: &str) -> String {
+    encode_error(
+        id,
+        "agent_prompt_precondition_failed",
+        format!("conditional prompt for named agent {name} rejected: {reason}"),
+    )
+}
+
 fn agent_not_ready(id: String, target: &str) -> String {
     encode_error(
         id,
@@ -354,7 +532,10 @@ fn agent_not_found(id: String, target: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        api::schema::{AgentStatus, SuccessResponse},
+        api::schema::{
+            AgentPromptIfExpected, AgentPromptIfParams, AgentStatus, PaneSendInputParams,
+            SuccessResponse,
+        },
         app::Mode,
         config::Config,
         detect::{Agent, AgentState},
@@ -376,6 +557,87 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app
+    }
+
+    fn bind_test_pi(
+        app: &mut App,
+        pane_id: crate::layout::PaneId,
+        name: &str,
+        session_path: &str,
+        state_change_seq: u64,
+    ) {
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(session_path).unwrap(),
+        });
+        terminal.set_agent_name(name.into());
+        terminal.last_agent_state_change_seq = Some(state_change_seq);
+    }
+
+    fn prompt_if_params(
+        app: &App,
+        pane_id: crate::layout::PaneId,
+        text: &str,
+    ) -> AgentPromptIfParams {
+        let agent = app.agent_info(0, pane_id).unwrap();
+        AgentPromptIfParams {
+            name: agent.name.clone().unwrap(),
+            text: text.into(),
+            expected: AgentPromptIfExpected {
+                terminal_id: agent.terminal_id,
+                agent: agent.agent.unwrap(),
+                agent_session: agent.agent_session.unwrap(),
+                revision: agent.revision,
+                state_change_seq: agent.state_change_seq,
+                input_submission_token: agent.input_submission_token,
+            },
+        }
+    }
+
+    fn start_deferred_agent_prompt_if(
+        app: &mut App,
+        id: &str,
+        params: AgentPromptIfParams,
+    ) -> std::sync::mpsc::Receiver<String> {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        assert!(app.handle_deferred_agent_api_request(
+            crate::api::schema::Request {
+                id: id.into(),
+                method: crate::api::schema::Method::AgentPromptIf(params),
+            },
+            respond_to,
+        ));
+        response_rx
+    }
+
+    fn run_deferred_agent_prompt_if(
+        app: &mut App,
+        id: &str,
+        params: AgentPromptIfParams,
+    ) -> String {
+        start_deferred_agent_prompt_if(app, id, params)
+            .recv_timeout(Duration::from_secs(1))
+            .expect("conditional agent prompt responds after submission")
+    }
+
+    fn assert_prompt_if_rejected_without_input(
+        app: &mut App,
+        params: AgentPromptIfParams,
+        rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
+    ) -> crate::api::schema::ErrorResponse {
+        let response = run_deferred_agent_prompt_if(app, "req", params);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "rejected prompt wrote terminal input"
+        );
+        error
     }
 
     fn start_deferred_agent_prompt(
@@ -621,6 +883,287 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "agent_not_ready");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_if_rejects_changed_lifecycle_without_input() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        bind_test_pi(&mut app, pane_id, "reviewer", "/tmp/pi-session.jsonl", 41);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let params = prompt_if_params(&app, pane_id, "must not be sent");
+
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        terminal.last_agent_state_change_seq = Some(42);
+
+        let error = assert_prompt_if_rejected_without_input(&mut app, params, &mut rx);
+        assert_eq!(error.error.code, "agent_prompt_precondition_failed");
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_if_rejects_non_pi_native_binding() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+        });
+        terminal.set_agent_name("reviewer".into());
+        terminal.last_agent_state_change_seq = Some(41);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let params = prompt_if_params(&app, pane_id, "must not be sent");
+
+        let error = assert_prompt_if_rejected_without_input(&mut app, params, &mut rx);
+        assert_eq!(error.error.code, "agent_prompt_precondition_failed");
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_if_rejects_name_rebound_to_another_terminal() {
+        let mut app = app_with_agent();
+        let first = app.state.workspaces[0].tabs[0].root_pane;
+        let second = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        bind_test_pi(&mut app, first, "reviewer", "/tmp/pi-session.jsonl", 41);
+        bind_test_pi(&mut app, second, "other", "/tmp/other-session.jsonl", 41);
+        let (first_runtime, mut first_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let (second_runtime, mut second_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(first, first_runtime);
+        app.state.insert_test_runtime(second, second_runtime);
+        let params = prompt_if_params(&app, first, "must not be sent");
+
+        let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&first_terminal_id)
+            .unwrap()
+            .clear_agent_name();
+        let second_terminal_id = app.state.workspaces[0].tabs[0].panes[&second]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&second_terminal_id)
+            .unwrap()
+            .set_agent_name("reviewer".into());
+
+        let error = assert_prompt_if_rejected_without_input(&mut app, params, &mut second_rx);
+        assert_eq!(error.error.code, "agent_prompt_precondition_failed");
+        assert!(first_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_if_rejects_changed_session_and_revision() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        bind_test_pi(&mut app, pane_id, "reviewer", "/tmp/pi-session.jsonl", 41);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let session_params = prompt_if_params(&app, pane_id, "must not be sent");
+
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(
+                    "/tmp/replacement-session.jsonl",
+                )
+                .unwrap(),
+            });
+        let error = assert_prompt_if_rejected_without_input(&mut app, session_params, &mut rx);
+        assert_eq!(error.error.code, "agent_prompt_precondition_failed");
+
+        let mut revision_params = prompt_if_params(&app, pane_id, "must not be sent");
+        revision_params.expected.revision += 1;
+        let error = assert_prompt_if_rejected_without_input(&mut app, revision_params, &mut rx);
+        assert_eq!(error.error.code, "agent_prompt_precondition_failed");
+    }
+
+    #[tokio::test]
+    async fn ordinary_prompt_and_direct_input_invalidate_observed_token() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        bind_test_pi(&mut app, pane_id, "reviewer", "/tmp/pi-session.jsonl", 41);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let stale_after_prompt = prompt_if_params(&app, pane_id, "must not be sent");
+
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "ordinary",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "ordinary prompt".into(),
+                wait: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentPrompted { agent } = success.result else {
+            panic!("expected prompted response");
+        };
+        assert_eq!(
+            agent.input_submission_token,
+            stale_after_prompt.expected.input_submission_token + 1
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"ordinary prompt")
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+        let error = assert_prompt_if_rejected_without_input(&mut app, stale_after_prompt, &mut rx);
+        assert!(error
+            .error
+            .message
+            .contains("input submission token is stale"));
+
+        let stale_after_input = prompt_if_params(&app, pane_id, "must not be sent");
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let response = app.handle_pane_send_input(
+            "direct".into(),
+            PaneSendInputParams {
+                pane_id: public_pane_id,
+                text: "direct input".into(),
+                keys: Vec::new(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"direct input"));
+        assert_eq!(
+            app.agent_info(0, pane_id).unwrap().input_submission_token,
+            stale_after_input.expected.input_submission_token + 1
+        );
+        let error = assert_prompt_if_rejected_without_input(&mut app, stale_after_input, &mut rx);
+        assert!(error
+            .error
+            .message
+            .contains("input submission token is stale"));
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_if_rejects_missing_and_ambiguous_names() {
+        let mut app = app_with_agent();
+        let first = app.state.workspaces[0].tabs[0].root_pane;
+        let second = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        bind_test_pi(&mut app, first, "reviewer", "/tmp/pi-session.jsonl", 41);
+        bind_test_pi(&mut app, second, "other", "/tmp/other-session.jsonl", 41);
+        let (first_runtime, mut first_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let (second_runtime, mut second_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(first, first_runtime);
+        app.state.insert_test_runtime(second, second_runtime);
+        let params = prompt_if_params(&app, first, "must not be sent");
+
+        let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&first_terminal_id)
+            .unwrap()
+            .clear_agent_name();
+        let missing =
+            assert_prompt_if_rejected_without_input(&mut app, params.clone(), &mut first_rx);
+        assert_eq!(missing.error.code, "agent_not_found");
+
+        app.state
+            .terminals
+            .get_mut(&first_terminal_id)
+            .unwrap()
+            .set_agent_name("reviewer".into());
+        let second_terminal_id = app.state.workspaces[0].tabs[0].panes[&second]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&second_terminal_id)
+            .unwrap()
+            .set_agent_name("reviewer".into());
+        let ambiguous = assert_prompt_if_rejected_without_input(&mut app, params, &mut second_rx);
+        assert_eq!(ambiguous.error.code, "agent_target_ambiguous");
+        assert!(first_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_if_accepts_once_and_rejects_duplicate_while_in_flight() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        bind_test_pi(&mut app, pane_id, "reviewer", "/tmp/pi-session.jsonl", 41);
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .seen = false;
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let params = prompt_if_params(&app, pane_id, "exact prompt");
+        assert_eq!(
+            app.agent_info(0, pane_id).unwrap().agent_status,
+            AgentStatus::Done
+        );
+
+        let first = start_deferred_agent_prompt_if(&mut app, "first", params.clone());
+        let second = run_deferred_agent_prompt_if(&mut app, "second", params.clone());
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&second).unwrap();
+        assert_eq!(error.error.code, "agent_prompt_precondition_failed");
+        assert!(error
+            .error
+            .message
+            .contains("input submission token is stale"));
+
+        let response = first.recv_timeout(Duration::from_secs(1)).unwrap();
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentPrompted { agent } = success.result else {
+            panic!("expected prompted response");
+        };
+        assert_eq!(agent.revision, params.expected.revision);
+        assert_eq!(
+            agent.input_submission_token,
+            params.expected.input_submission_token + 1
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"exact prompt"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+        assert!(
+            rx.try_recv().is_err(),
+            "prompt was submitted more than once"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_if_requires_an_exact_name_not_a_pane_id() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        bind_test_pi(&mut app, pane_id, "reviewer", "/tmp/pi-session.jsonl", 41);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let mut params = prompt_if_params(&app, pane_id, "must not be sent");
+        params.name = app.public_pane_id(0, pane_id).unwrap();
+
+        let error = assert_prompt_if_rejected_without_input(&mut app, params, &mut rx);
+        assert_eq!(error.error.code, "agent_not_found");
     }
 
     #[test]

@@ -85,6 +85,13 @@ impl App {
             }
         }
 
+        self.resolve_named_agent_target(target)
+    }
+
+    pub(crate) fn resolve_named_agent_target(
+        &self,
+        name: &str,
+    ) -> Result<TerminalTarget, TerminalTargetError> {
         let name_matches: Vec<_> = self
             .terminal_targets()
             .into_iter()
@@ -93,15 +100,15 @@ impl App {
                     .terminals
                     .values()
                     .find(|terminal| terminal.id.to_string() == candidate.terminal_id)
-                    .is_some_and(|terminal| terminal.agent_name.as_deref() == Some(target))
+                    .is_some_and(|terminal| terminal.agent_name.as_deref() == Some(name))
             })
             .collect();
-        if let Some(resolved) = self.single_terminal_match(target, name_matches)? {
+        if let Some(resolved) = self.single_terminal_match(name, name_matches)? {
             return Ok(resolved);
         }
 
         Err(TerminalTargetError::NotFound {
-            target: target.to_string(),
+            target: name.to_string(),
         })
     }
 

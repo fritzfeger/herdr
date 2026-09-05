@@ -1222,6 +1222,62 @@
     },
     "request": {
       "$defs": {
+        "AgentPromptIfExpected": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "agent_session": {
+              "$ref": "#/schemas/request/$defs/AgentSessionInfo"
+            },
+            "input_submission_token": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state_change_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "agent",
+            "agent_session",
+            "revision",
+            "state_change_seq",
+            "input_submission_token"
+          ],
+          "type": "object"
+        },
+        "AgentPromptIfParams": {
+          "properties": {
+            "expected": {
+              "$ref": "#/schemas/request/$defs/AgentPromptIfExpected"
+            },
+            "name": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "text",
+            "expected"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -1331,6 +1387,36 @@
             "keys"
           ],
           "type": "object"
+        },
+        "AgentSessionInfo": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/AgentSessionRefKind"
+            },
+            "source": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "agent",
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "AgentSessionRefKind": {
+          "enum": [
+            "id",
+            "path"
+          ],
+          "type": "string"
         },
         "AgentStartParams": {
           "properties": {
@@ -5442,6 +5528,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.prompt_if",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptIfParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.wait",
               "type": "string"
             },
@@ -6619,6 +6721,12 @@
                 "string",
                 "null"
               ]
+            },
+            "input_submission_token": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
             },
             "interactive_ready": {
               "type": "boolean"

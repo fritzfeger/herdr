@@ -18,6 +18,8 @@ pub(crate) struct HandoffRuntimeState {
     pub cell_width_px: u32,
     pub cell_height_px: u32,
     #[serde(default)]
+    pub input_submission_token: u64,
+    #[serde(default)]
     pub keyboard_protocol_flags: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard_protocol_ansi: Option<String>,

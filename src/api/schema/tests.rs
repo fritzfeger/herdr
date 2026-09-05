@@ -149,6 +149,39 @@ fn agent_start_and_prompt_requests_round_trip() {
         serde_json::from_value::<Request>(prompt_and_wait_json).unwrap(),
         prompt_and_wait
     );
+
+    let prompt_if = Request {
+        id: "prompt-if".into(),
+        method: Method::AgentPromptIf(AgentPromptIfParams {
+            name: "reviewer".into(),
+            text: "review this".into(),
+            expected: AgentPromptIfExpected {
+                terminal_id: "term_1".into(),
+                agent: "pi".into(),
+                agent_session: AgentSessionInfo {
+                    source: "herdr:pi".into(),
+                    agent: "pi".into(),
+                    kind: crate::agent_resume::AgentSessionRefKind::Path,
+                    value: "/tmp/pi-session.jsonl".into(),
+                },
+                revision: 7,
+                state_change_seq: 11,
+                input_submission_token: 13,
+            },
+        }),
+    };
+    let prompt_if_json = serde_json::to_value(&prompt_if).unwrap();
+    assert_eq!(prompt_if_json["method"], "agent.prompt_if");
+    assert_eq!(prompt_if_json["params"]["name"], "reviewer");
+    assert_eq!(prompt_if_json["params"]["expected"]["revision"], 7);
+    assert_eq!(
+        prompt_if_json["params"]["expected"]["input_submission_token"],
+        13
+    );
+    assert_eq!(
+        serde_json::from_value::<Request>(prompt_if_json).unwrap(),
+        prompt_if
+    );
 }
 
 #[test]

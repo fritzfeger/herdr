@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
-    ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentPromptIfExpected, AgentPromptIfParams, AgentPromptParams, AgentPromptWaitOptions,
+    AgentReadParams, AgentRenameParams, AgentSendKeysParams, AgentSessionInfo, AgentStartParams,
+    AgentTarget, AgentWaitParams, EmptyParams, ErrorBody, ErrorResponse, Method,
+    PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -21,6 +22,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
+        "prompt-if" => agent_prompt_if(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
@@ -840,6 +842,117 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&response)
 }
 
+fn agent_prompt_if(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent prompt-if <name> <text> --expect-terminal-id ID --expect-agent pi --expect-session-source herdr:pi --expect-session-kind id|path --expect-session-value VALUE --expect-revision N --expect-state-change-seq N --expect-input-submission-token N";
+
+    let Some(name) = args.first() else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    let Some(text) = args.get(1) else {
+        eprintln!("agent prompt-if requires text");
+        return Ok(2);
+    };
+    let mut terminal_id = None;
+    let mut agent = None;
+    let mut session_source = None;
+    let mut session_kind = None;
+    let mut session_value = None;
+    let mut revision = None;
+    let mut state_change_seq = None;
+    let mut input_submission_token = None;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        if matches!(option, "help" | "--help" | "-h") {
+            eprintln!("{USAGE}");
+            return Ok(0);
+        }
+        let Some(value) = args.get(index + 1) else {
+            eprintln!("missing value for {option}");
+            return Ok(2);
+        };
+        match option {
+            "--expect-terminal-id" => terminal_id = Some(value.clone()),
+            "--expect-agent" => agent = Some(value.clone()),
+            "--expect-session-source" => session_source = Some(value.clone()),
+            "--expect-session-kind" => {
+                session_kind = match value.as_str() {
+                    "id" => Some(crate::agent_resume::AgentSessionRefKind::Id),
+                    "path" => Some(crate::agent_resume::AgentSessionRefKind::Path),
+                    other => {
+                        eprintln!("invalid --expect-session-kind: {other} (expected id or path)");
+                        return Ok(2);
+                    }
+                }
+            }
+            "--expect-session-value" => session_value = Some(value.clone()),
+            "--expect-revision" => revision = Some(super::parse_u64_flag(option, value)?),
+            "--expect-state-change-seq" => {
+                state_change_seq = Some(super::parse_u64_flag(option, value)?)
+            }
+            "--expect-input-submission-token" => {
+                input_submission_token = Some(super::parse_u64_flag(option, value)?)
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+        index += 2;
+    }
+
+    let missing = [
+        ("--expect-terminal-id", terminal_id.is_none()),
+        ("--expect-agent", agent.is_none()),
+        ("--expect-session-source", session_source.is_none()),
+        ("--expect-session-kind", session_kind.is_none()),
+        ("--expect-session-value", session_value.is_none()),
+        ("--expect-revision", revision.is_none()),
+        ("--expect-state-change-seq", state_change_seq.is_none()),
+        (
+            "--expect-input-submission-token",
+            input_submission_token.is_none(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(flag, is_missing)| is_missing.then_some(flag))
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        eprintln!("missing required options: {}", missing.join(", "));
+        return Ok(2);
+    }
+
+    let expected_agent = agent.unwrap();
+    if expected_agent != "pi" || session_source.as_deref() != Some("herdr:pi") {
+        eprintln!(
+            "agent prompt-if requires --expect-agent pi and --expect-session-source herdr:pi"
+        );
+        return Ok(2);
+    }
+    let response = super::send_request(&Request {
+        id: "cli:agent:prompt-if".into(),
+        method: Method::AgentPromptIf(AgentPromptIfParams {
+            name: name.clone(),
+            text: text.clone(),
+            expected: AgentPromptIfExpected {
+                terminal_id: terminal_id.unwrap(),
+                agent: expected_agent.clone(),
+                agent_session: AgentSessionInfo {
+                    source: session_source.unwrap(),
+                    agent: expected_agent,
+                    kind: session_kind.unwrap(),
+                    value: session_value.unwrap(),
+                },
+                revision: revision.unwrap(),
+                state_change_seq: state_change_seq.unwrap(),
+                input_submission_token: input_submission_token.unwrap(),
+            },
+        }),
+    })?;
+    super::print_response(&response)
+}
+
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
         eprintln!("usage: herdr agent send-keys <target> <key> [key ...]");
@@ -926,6 +1039,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+    eprintln!("  herdr agent prompt-if <name> <text> --expect-terminal-id ID --expect-agent pi --expect-session-source herdr:pi --expect-session-kind id|path --expect-session-value VALUE --expect-revision N --expect-state-change-seq N --expect-input-submission-token N");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
