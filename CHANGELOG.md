@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- Added conditional agent prompts that reject stale requests when the target terminal or agent session has changed.
-
 ## [0.8.2] - 2026-08-19
 
 ### Added
