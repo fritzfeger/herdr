@@ -23,39 +23,6 @@ These instructions are layered.
   not a verified maintainer, the work is happening in a fork, or the account
   cannot be determined.
 
-## Fritz Local Downstream Workflow
-
-This section applies exclusively to the checkout
-`/Users/fritzfeger/Code/herdr`. Within that checkout, it takes precedence over
-both the Maintainer Workflow and the External contributor guardrail below.
-
-- This checkout is used to develop and test local Herdr patches and prepare them
-  for later controlled publication.
-- Normal work sessions may modify code and documentation and run tests.
-- Work sessions must not push, create pull requests or issues, trigger releases,
-  or modify remotes or tracking branches.
-- Work sessions do not conduct formal reviews or create commits.
-- Stage changes only on explicit user instruction and only for the named
-  snapshot. Leave unrelated or pre-existing changes untouched.
-- Always delegate formal `/review-code` and `/review-prose` reviews to the stable
-  session `herdr-review`. Invoke the review command without path arguments; the
-  staged snapshot alone defines the review scope.
-- Only `herdr-review` may create a commit, and only after a fresh `correct`
-  review and an explicit `/commit` instruction.
-- `herdr-review` must not push. Publication and push require a later, separate,
-  explicit authorization.
-- `herdr-review` does not implement review fixes. The responsible work session
-  implements them, selectively stages the revised snapshot on explicit user
-  instruction, and delegates a new review.
-- For this checkout, skip automatic commit-metadata generation. Neither work
-  sessions nor `herdr-review` may create or modify `CHANGELOG.md`,
-  `docs/next/CHANGELOG.md`, or `log.md`, or include them in a commit. If any of
-  these files already has unrelated changes, preserve those changes and exclude
-  them from the snapshot.
-- The local `port/conditional-prompt-upstream` branch and commit `f58f5cb2` are
-  the current patch state. This documentation change must not alter existing
-  work or Git history.
-
 ## Universal Project Rules
 
 ### Principles
