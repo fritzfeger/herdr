@@ -184,6 +184,23 @@ pub struct AgentPromptParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentPromptIfExpected {
+    pub terminal_id: String,
+    pub agent: String,
+    pub agent_session: AgentSessionInfo,
+    pub revision: u64,
+    pub state_change_seq: u64,
+    pub input_submission_token: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentPromptIfParams {
+    pub name: String,
+    pub text: String,
+    pub expected: AgentPromptIfExpected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +240,8 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     pub revision: u64,
+    #[serde(default)]
+    pub input_submission_token: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
