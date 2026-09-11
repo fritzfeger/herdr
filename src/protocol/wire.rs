@@ -1540,7 +1540,7 @@ pub(crate) fn modifier_with_underline_style(
 
 /// Converts a u16 back to a ratatui `Modifier`.
 fn u16_to_modifier(val: u16) -> ratatui::style::Modifier {
-    ratatui::style::Modifier::from_bits_truncate(val & !UNDERLINE_STYLE_MASK)
+    ratatui::style::Modifier::from_bits_retain(val)
 }
 
 // ---------------------------------------------------------------------------

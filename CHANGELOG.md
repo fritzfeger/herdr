@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve double, single, curly, and dotted underline styles during frame composition.
+
 ## [0.9.0] - 2026-09-07
 
 ### Added
