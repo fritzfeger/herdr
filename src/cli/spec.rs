@@ -363,6 +363,32 @@ fn agent_command() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("prompt-if")
+                .about("Submit a prompt only if an exact named-agent binding is unchanged")
+                .override_usage("herdr agent prompt-if <NAME> <TEXT> [OPTIONS]")
+                .arg(required("name", "NAME"))
+                .arg(required("text", "TEXT"))
+                .arg(option("expect-terminal-id", "ID").required(true))
+                .arg(
+                    option("expect-agent", "KIND")
+                        .required(true)
+                        .value_parser(["pi"]),
+                )
+                .arg(option("expect-session-source", "SOURCE").required(true))
+                .arg(
+                    option("expect-session-kind", "KIND")
+                        .required(true)
+                        .value_parser(["id", "path"]),
+                )
+                .arg(option("expect-session-value", "VALUE").required(true))
+                .arg(option("expect-revision", "N").required(true))
+                .arg(option("expect-state-change-seq", "N").required(true))
+                .arg(option("expect-input-submission-token", "N").required(true))
+                .after_help(
+                    "The server resolves NAME only as an exact live Pi agent name, requires a native herdr:pi session binding, compares every supplied binding field and the shared terminal input-submission token, requires idle or done, and submits at most once for the compared token. Any accepted terminal input advances that token; any mismatch sends no input.",
+                ),
+        )
+        .subcommand(
             Command::new("rename")
                 .about("Rename an agent")
                 .override_usage("herdr agent rename <TARGET> <NAME>|--clear")

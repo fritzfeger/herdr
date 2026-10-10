@@ -1555,6 +1555,18 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
             "params": {"target": pane_id, "name": "reviewer"}
         }),
     ));
+    let before_handoff = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:agent:before-handoff",
+            "method": "agent.get",
+            "params": {"target": "reviewer"}
+        }),
+    );
+    let input_submission_token = before_handoff["result"]["agent"]["input_submission_token"]
+        .as_u64()
+        .expect("agent response includes input submission token");
+    assert!(input_submission_token > 0);
 
     assert_ok(request(
         &api_socket,
@@ -1562,6 +1574,19 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     ));
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let after_handoff = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:agent:after-handoff",
+            "method": "agent.get",
+            "params": {"target": "reviewer"}
+        }),
+    );
+    assert_eq!(
+        after_handoff["result"]["agent"]["input_submission_token"],
+        input_submission_token
+    );
 
     assert_ok(request(
         &api_socket,

@@ -9,6 +9,13 @@ use tokio::sync::{mpsc, Notify};
 use crate::events::AppEvent;
 use crate::layout::PaneId;
 
+#[derive(Debug)]
+pub(crate) enum ConditionalInputError {
+    TokenMismatch,
+    TokenExhausted,
+    Send(std::io::Error),
+}
+
 /// Live runtime for a server-owned terminal.
 ///
 /// The PTY implementation still delegates to the legacy pane runtime while the
@@ -474,6 +481,10 @@ impl TerminalRuntime {
         self.0.encode_terminal_key(key)
     }
 
+    pub fn input_submission_token(&self) -> u64 {
+        self.0.input_submission_token()
+    }
+
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_bytes(bytes)
     }
@@ -487,6 +498,17 @@ impl TerminalRuntime {
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.0
             .queue_user_input_submission(text, enter, delay, deadline)
+    }
+
+    pub(crate) fn queue_user_input_submission_if(
+        &self,
+        expected_token: u64,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+    ) -> Result<std::sync::mpsc::Receiver<std::io::Result<()>>, ConditionalInputError> {
+        self.0
+            .queue_user_input_submission_if(expected_token, text, enter, delay)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {

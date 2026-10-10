@@ -281,3 +281,91 @@ fn prompt_wait_is_sent_as_one_agent_request() {
     server.join().unwrap();
     cleanup_test_base(&base);
 }
+
+#[test]
+fn prompt_if_is_sent_as_one_conditional_server_request() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, line) = accept_fake_cli_operation(&listener);
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "agent.prompt_if");
+        assert_eq!(request["params"]["name"], "pi-steering");
+        assert_eq!(request["params"]["text"], "unchanged prompt");
+        assert_eq!(request["params"]["expected"]["terminal_id"], "term_1");
+        assert_eq!(request["params"]["expected"]["agent"], "pi");
+        assert_eq!(
+            request["params"]["expected"]["agent_session"],
+            serde_json::json!({
+                "source": "herdr:pi",
+                "agent": "pi",
+                "kind": "path",
+                "value": "/tmp/pi-session.jsonl"
+            })
+        );
+        assert_eq!(request["params"]["expected"]["revision"], 7);
+        assert_eq!(request["params"]["expected"]["state_change_seq"], 11);
+        assert_eq!(request["params"]["expected"]["input_submission_token"], 13);
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "id": request["id"],
+                "result": {
+                    "type": "agent_prompted",
+                    "agent": {
+                        "pane_id": "w1:p1",
+                        "terminal_id": "term_1",
+                        "name": "pi-steering",
+                        "agent": "pi",
+                        "agent_status": "idle",
+                        "workspace_id": "w1",
+                        "tab_id": "w1:t1",
+                        "focused": false,
+                        "revision": 7,
+                        "input_submission_token": 14
+                    }
+                }
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let prompted = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "prompt-if",
+            "pi-steering",
+            "unchanged prompt",
+            "--expect-terminal-id",
+            "term_1",
+            "--expect-agent",
+            "pi",
+            "--expect-session-source",
+            "herdr:pi",
+            "--expect-session-kind",
+            "path",
+            "--expect-session-value",
+            "/tmp/pi-session.jsonl",
+            "--expect-revision",
+            "7",
+            "--expect-state-change-seq",
+            "11",
+            "--expect-input-submission-token",
+            "13",
+        ],
+    );
+    assert!(
+        prompted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prompted.stderr)
+    );
+
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}
