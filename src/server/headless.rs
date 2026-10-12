@@ -803,11 +803,11 @@ impl HeadlessServer {
         if outer_terminal_focus == Some(true) {
             self.app.state.mark_active_tab_seen();
         }
-        self.app.set_host_terminal_appearance_state(
+        self.app.set_host_terminal_context(
+            host_terminal_theme,
             host_terminal_appearance,
             host_terminal_appearance_explicit,
         );
-        self.app.set_host_terminal_theme(host_terminal_theme);
     }
 
     fn sync_visible_server_config_diagnostic(&mut self, uses_local_keybindings: bool) {
@@ -2222,11 +2222,11 @@ impl HeadlessServer {
                 if !client.shell_surface_active || self.foreground_client_id != Some(client_id) {
                     return false;
                 }
-                let mut changed = self.app.set_host_terminal_appearance_state(
+                let changed = self.app.set_host_terminal_context(
+                    client.host_terminal_theme,
                     client.host_terminal_appearance,
                     client.host_terminal_appearance_explicit,
                 );
-                changed |= self.app.set_host_terminal_theme(client.host_terminal_theme);
                 if changed {
                     self.resize_shared_runtime_to_effective_size_before_input();
                 }

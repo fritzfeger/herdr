@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix embedded application color refreshes by notifying subscribed applications after host palette updates, even when light/dark appearance is unchanged.
+
 - Added conditional agent prompting so automation can reject stale submissions when terminal or agent state has changed.
 
 ## [0.9.3] - 2026-09-29

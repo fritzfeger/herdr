@@ -660,6 +660,10 @@ impl TerminalRuntime {
         self.0.test_process_pty_bytes(bytes);
     }
 
+    pub(crate) fn test_process_pty_bytes_with_responses(&self, bytes: &[u8]) -> Vec<Bytes> {
+        self.0.test_process_pty_bytes_with_responses(bytes)
+    }
+
     pub(crate) fn test_with_scrollback_bytes(
         cols: u16,
         rows: u16,
