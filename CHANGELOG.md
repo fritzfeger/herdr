@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix embedded application color refreshes by notifying subscribed applications after host palette updates, even when light/dark appearance is unchanged.
+
+- Added conditional agent prompting so automation can reject stale submissions when terminal or agent state has changed.
+
 ## [0.9.5] - 2026-10-14
 
 This is a hotfix release for v0.9.4. See the v0.9.4 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.4

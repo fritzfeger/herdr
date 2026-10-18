@@ -1203,6 +1203,51 @@ mod tests {
     }
 
     #[test]
+    fn frame_composition_preserves_underline_styles_in_ansi() {
+        use ratatui::buffer::{Buffer, Cell};
+        use ratatui::layout::Rect;
+        use ratatui::style::{Color, Modifier, Style};
+
+        let styles = [
+            ("D", 2, "4:2"),
+            ("O", 1, "4"),
+            ("A", 5, "4:5"),
+            ("P", 4, "4:4"),
+        ];
+        let area = Rect::new(0, 0, styles.len() as u16, 1);
+        let mut pane_buffer = Buffer::filled(area, Cell::new(" "));
+        for (x, (symbol, underline_style, _)) in styles.iter().enumerate() {
+            let cell = pane_buffer.cell_mut((x as u16, 0)).unwrap();
+            cell.set_symbol(symbol);
+            cell.modifier = crate::protocol::modifier_with_underline_style(
+                Modifier::UNDERLINED,
+                *underline_style,
+            );
+        }
+
+        let mut frame = FrameData::from_ratatui_buffer(&pane_buffer, None);
+        let mut composed = frame.to_ratatui_buffer().unwrap();
+        composed.set_style(area, Style::default().fg(Color::Red));
+        frame.replace_from_ratatui_buffer_preserving_effects(&composed, None);
+
+        for (cell, (_, underline_style, _)) in frame.cells.iter().zip(styles) {
+            assert!(cell.modifier & Modifier::UNDERLINED.bits() != 0);
+            assert_eq!(
+                underline_style_from_modifier(cell.modifier),
+                underline_style
+            );
+        }
+
+        let output = String::from_utf8(BlitEncoder::new().encode(&frame, false).bytes).unwrap();
+        for (symbol, _, sgr) in styles {
+            assert!(
+                output.contains(&format!("\x1b[0;{sgr};31;49m{symbol}")),
+                "missing {sgr} underline before {symbol}: {output:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cells_equal_identical() {
         let a = make_cell("A", 2, 1, 0);
         let b = make_cell("A", 2, 1, 0);

@@ -1419,6 +1419,76 @@ mod tests {
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
     }
 
+    #[tokio::test]
+    async fn host_terminal_context_applies_palette_before_notifying_child() {
+        use crate::terminal_theme::{HostAppearance, RgbColor, TerminalTheme};
+        let mut app = test_app();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let (runtime, mut receiver) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let dark = TerminalTheme {
+            background: Some(RgbColor {
+                r: 0,
+                g: 0x2b,
+                b: 0x36,
+            }),
+            ..Default::default()
+        };
+        let light = TerminalTheme {
+            background: Some(RgbColor {
+                r: 0xfd,
+                g: 0xf6,
+                b: 0xe3,
+            }),
+            ..Default::default()
+        };
+        app.set_host_terminal_context(dark, Some(HostAppearance::Dark), true);
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?2031h");
+
+        app.set_host_terminal_context(light, Some(HostAppearance::Light), true);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[?997;2n")
+        );
+        assert_eq!(
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .test_process_pty_bytes_with_responses(b"\x1b]11;?\x1b\\"),
+            vec![bytes::Bytes::from_static(
+                b"\x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\"
+            )]
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(!app.set_host_terminal_context(light, Some(HostAppearance::Light), true));
+        assert!(receiver.try_recv().is_err());
+
+        // The new appearance can arrive before its colors, including after reattachment.
+        app.set_host_terminal_context(light, Some(HostAppearance::Dark), true);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[?997;1n")
+        );
+        app.set_host_terminal_context(dark, Some(HostAppearance::Dark), true);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[?997;1n")
+        );
+        assert_eq!(
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .test_process_pty_bytes_with_responses(b"\x1b]11;?\x1b\\"),
+            vec![bytes::Bytes::from_static(
+                b"\x1b]11;rgb:0000/2b2b/3636\x1b\\"
+            )]
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn theme_auto_switch_is_opt_in_and_preserves_manual_default() {
         let mut config = Config::default();

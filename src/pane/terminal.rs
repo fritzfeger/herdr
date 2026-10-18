@@ -207,6 +207,7 @@ pub(crate) struct GhosttyPaneCore {
     pub initial_default_foreground: Option<crate::ghostty::RgbColor>,
     pub initial_default_background: Option<crate::ghostty::RgbColor>,
     pub host_terminal_theme: crate::terminal_theme::TerminalTheme,
+    host_terminal_theme_report_pending: bool,
     pub transient_default_color_owner_pgid: Option<u32>,
     pub default_color_tracker: DefaultColorOscTracker,
     pub default_color_event_tracker: DefaultColorEventTracker,
@@ -1193,6 +1194,7 @@ impl GhosttyPaneTerminal {
                 initial_default_foreground,
                 initial_default_background,
                 host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
+                host_terminal_theme_report_pending: false,
                 transient_default_color_owner_pgid: None,
                 default_color_tracker: DefaultColorOscTracker::default(),
                 default_color_event_tracker: DefaultColorEventTracker::default(),
@@ -1220,6 +1222,7 @@ impl GhosttyPaneTerminal {
         if let Ok(mut core) = self.core.lock() {
             let foreground_unowned = !core.child_default_foreground_changed;
             let background_unowned = !core.child_default_background_changed;
+            core.host_terminal_theme_report_pending |= core.host_terminal_theme != theme;
             core.host_terminal_theme = theme;
             if foreground_unowned && background_unowned {
                 core.transient_default_color_owner_pgid = None;
@@ -1263,7 +1266,7 @@ impl GhosttyPaneTerminal {
             (previous, color_scheme),
             (Some(previous), Some(current)) if previous != current
         );
-        if !transitioned
+        if !(transitioned || core.host_terminal_theme_report_pending)
             || !core
                 .terminal
                 .mode_get(crate::ghostty::MODE_COLOR_SCHEME_REPORT)
@@ -1271,7 +1274,10 @@ impl GhosttyPaneTerminal {
         {
             return None;
         }
-        appearance.map(|appearance| Bytes::from_static(appearance.color_scheme_report()))
+        let appearance = appearance?;
+        // A repeated scheme report prompts subscribers to re-query late OSC colors too.
+        core.host_terminal_theme_report_pending = false;
+        Some(Bytes::from_static(appearance.color_scheme_report()))
     }
 
     pub fn has_transient_default_color_override(&self) -> bool {
@@ -6550,6 +6556,80 @@ mod tests {
             .apply_host_terminal_appearance(Some(crate::terminal_theme::HostAppearance::Light))
             .is_none());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn color_scheme_report_refreshes_after_palette_catches_up() {
+        use crate::terminal_theme::{HostAppearance, RgbColor, TerminalTheme};
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let dark = TerminalTheme {
+            background: Some(RgbColor {
+                r: 0,
+                g: 0x2b,
+                b: 0x36,
+            }),
+            ..Default::default()
+        };
+        let light = TerminalTheme {
+            background: Some(RgbColor {
+                r: 0xfd,
+                g: 0xf6,
+                b: 0xe3,
+            }),
+            ..Default::default()
+        };
+        pane.apply_host_terminal_theme(dark);
+        assert!(pane
+            .apply_host_terminal_appearance(Some(HostAppearance::Dark))
+            .is_none());
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2031h", &tx);
+        assert_eq!(
+            pane.apply_host_terminal_appearance(Some(HostAppearance::Light)),
+            Some(Bytes::from_static(b"\x1b[?997;2n"))
+        );
+        assert_eq!(
+            pane.process_pty_bytes(pane_id, 0, b"\x1b]11;?\x1b\\", &tx)
+                .terminal_responses,
+            vec![Bytes::from_static(b"\x1b]11;rgb:0000/2b2b/3636\x1b\\")]
+        );
+
+        // Appearance and OSC colors arrive separately; the second update must wake the child again.
+        pane.apply_host_terminal_theme(light);
+        assert_eq!(
+            pane.apply_host_terminal_appearance(Some(HostAppearance::Light)),
+            Some(Bytes::from_static(b"\x1b[?997;2n"))
+        );
+        assert_eq!(
+            pane.process_pty_bytes(pane_id, 0, b"\x1b]11;?\x1b\\", &tx)
+                .terminal_responses,
+            vec![Bytes::from_static(b"\x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\")]
+        );
+        pane.apply_host_terminal_theme(light);
+        assert!(pane
+            .apply_host_terminal_appearance(Some(HostAppearance::Light))
+            .is_none());
+
+        let violet = light.with_palette_color(
+            5,
+            RgbColor {
+                r: 0x76,
+                g: 0x52,
+                b: 0xa3,
+            },
+        );
+        pane.apply_host_terminal_theme(violet);
+        assert_eq!(
+            pane.apply_host_terminal_appearance(Some(HostAppearance::Light)),
+            Some(Bytes::from_static(b"\x1b[?997;2n"))
+        );
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2031l", &tx);
+        pane.apply_host_terminal_theme(dark);
+        assert!(pane
+            .apply_host_terminal_appearance(Some(HostAppearance::Dark))
+            .is_none());
     }
 
     #[test]

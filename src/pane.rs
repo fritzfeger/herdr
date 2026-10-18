@@ -1510,6 +1510,7 @@ pub struct PaneRuntime {
     kitty_keyboard_flags: Arc<AtomicU16>,
     content_seq: Arc<AtomicU64>,
     content_write_lock: Arc<Mutex<()>>,
+    input_submission_gate: Arc<InputSubmissionGate>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     self_reported_agent_active: Arc<AtomicBool>,
@@ -1519,6 +1520,103 @@ pub struct PaneRuntime {
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
     detect_handle: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Default)]
+struct InputSubmissionGate {
+    token: Mutex<u64>,
+}
+
+impl InputSubmissionGate {
+    #[cfg(unix)]
+    fn new(token: u64) -> Self {
+        Self {
+            token: Mutex::new(token),
+        }
+    }
+
+    fn current(&self) -> u64 {
+        *self
+            .token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn submit<F>(&self, bytes: Bytes, submit: F) -> Result<u64, mpsc::error::TrySendError<Bytes>>
+    where
+        F: FnOnce(Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>>,
+    {
+        let mut token = self
+            .token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(next) = token.checked_add(1) else {
+            return Err(mpsc::error::TrySendError::Full(bytes));
+        };
+        submit(bytes)?;
+        *token = next;
+        Ok(next)
+    }
+
+    fn queue_submission<F>(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        submit: F,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>>
+    where
+        F: FnOnce(
+            Bytes,
+            Bytes,
+            std::time::Duration,
+        ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>>,
+    {
+        let mut token = self
+            .token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(next) = token.checked_add(1) else {
+            return Err(std::io::Error::other("input submission token exhausted"));
+        };
+        let completion = submit(text, enter, delay)?;
+        *token = next;
+        Ok(completion)
+    }
+
+    fn queue_submission_if<F>(
+        &self,
+        expected: u64,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        submit: F,
+    ) -> Result<
+        std::sync::mpsc::Receiver<std::io::Result<()>>,
+        crate::terminal::ConditionalInputError,
+    >
+    where
+        F: FnOnce(
+            Bytes,
+            Bytes,
+            std::time::Duration,
+        ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>>,
+    {
+        let mut token = self
+            .token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *token != expected {
+            return Err(crate::terminal::ConditionalInputError::TokenMismatch);
+        }
+        let Some(next) = token.checked_add(1) else {
+            return Err(crate::terminal::ConditionalInputError::TokenExhausted);
+        };
+        let completion =
+            submit(text, enter, delay).map_err(crate::terminal::ConditionalInputError::Send)?;
+        *token = next;
+        Ok(completion)
+    }
 }
 
 enum PaneRuntimeIo {
@@ -2302,6 +2400,7 @@ impl PaneRuntime {
             cols,
             cell_width_px,
             cell_height_px,
+            input_submission_token: self.input_submission_token(),
             keyboard_protocol_flags: match self.keyboard_protocol() {
                 crate::input::KeyboardProtocol::Legacy => 0,
                 crate::input::KeyboardProtocol::Kitty { flags } => flags,
@@ -2516,6 +2615,7 @@ impl PaneRuntime {
             cols,
             cell_width_px,
             cell_height_px,
+            input_submission_token,
             keyboard_protocol_flags,
             keyboard_protocol_ansi,
             input_state,
@@ -2671,6 +2771,7 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             content_write_lock,
+            input_submission_gate: Arc::new(InputSubmissionGate::new(input_submission_token)),
             detection_content_seq,
             full_lifecycle_authority_active,
             self_reported_agent_active,
@@ -3284,6 +3385,7 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             content_write_lock,
+            input_submission_gate: Arc::new(InputSubmissionGate::default()),
             detection_content_seq,
             full_lifecycle_authority_active,
             self_reported_agent_active,
@@ -3670,8 +3772,14 @@ impl PaneRuntime {
         self.terminal.encode_terminal_key(key)
     }
 
+    pub fn input_submission_token(&self) -> u64 {
+        self.input_submission_gate.current()
+    }
+
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.io.try_send_bytes(bytes)
+        self.input_submission_gate
+            .submit(bytes, |bytes| self.io.try_send_bytes(bytes))
+            .map(|_| ())
     }
 
     /// Preflight a complete API command without changing input queue semantics.
@@ -3696,8 +3804,33 @@ impl PaneRuntime {
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
-        self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
+        self.input_submission_gate
+            .queue_submission(text, enter, delay, |text, enter, delay| {
+                self.io
+                    .queue_user_input_submission(text, enter, delay, deadline)
+            })
+    }
+
+    pub(crate) fn queue_user_input_submission_if(
+        &self,
+        expected_token: u64,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+    ) -> Result<
+        std::sync::mpsc::Receiver<std::io::Result<()>>,
+        crate::terminal::ConditionalInputError,
+    > {
+        self.input_submission_gate.queue_submission_if(
+            expected_token,
+            text,
+            enter,
+            delay,
+            |text, enter, delay| {
+                self.io
+                    .queue_user_input_submission(text, enter, delay, None)
+            },
+        )
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -4020,15 +4153,20 @@ impl PaneRuntime {
     }
 
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
+        let _ = self.test_process_pty_bytes_with_responses(bytes);
+    }
+
+    pub(crate) fn test_process_pty_bytes_with_responses(&self, bytes: &[u8]) -> Vec<Bytes> {
         let _content_write_guard = match self.content_write_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         self.content_seq.fetch_add(1, Ordering::AcqRel);
         let (tx, _rx) = mpsc::channel(1);
-        let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
+        let result = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
         self.content_seq.fetch_add(1, Ordering::Release);
         self.compression.wake();
+        result.terminal_responses
     }
 
     pub(crate) fn test_with_scrollback_bytes(
@@ -4077,6 +4215,7 @@ impl PaneRuntime {
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 content_seq: Arc::new(AtomicU64::new(0)),
                 content_write_lock: Arc::new(Mutex::new(())),
+                input_submission_gate: Arc::new(InputSubmissionGate::default()),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 self_reported_agent_active: Arc::new(AtomicBool::new(false)),
@@ -5260,17 +5399,20 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn handoff_runtime_state_captures_terminal_input_and_title_state() {
-        let runtime = PaneRuntime::test_with_screen_bytes(
-            80,
-            24,
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(
             b"\x1b[>5u\x1b[>4;2m\x1b[?1h\x1b[?2004h\x1b[?1004h\x1b[?1002h\x1b[?1006h\x1b[?2031h",
         );
-
         runtime.test_process_pty_bytes("\x1b]2;✳ 修复🙂标题\x1b\\".as_bytes());
         runtime.terminal.clear_agent_osc_state();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"handoff input"))
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"handoff input"));
         assert_eq!(runtime.agent_osc_title(), "");
         let pane = runtime.handoff_runtime_state(12);
 
+        assert_eq!(pane.input_submission_token, 1);
         assert_eq!(pane.keyboard_protocol_flags, 5);
         assert_eq!(pane.terminal_title.as_deref(), Some("✳ 修复🙂标题"));
         assert_eq!(
@@ -5401,6 +5543,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_submission_gate_is_shared_and_advances_only_after_acceptance() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        assert_eq!(runtime.input_submission_token(), 0);
+
+        runtime
+            .try_send_bytes(Bytes::from_static(b"first"))
+            .unwrap();
+        assert_eq!(runtime.input_submission_token(), 1);
+        assert!(runtime
+            .try_send_bytes(Bytes::from_static(b"queue full"))
+            .is_err());
+        assert_eq!(runtime.input_submission_token(), 1);
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"first"));
+
+        let stale = runtime.queue_user_input_submission_if(
+            0,
+            Bytes::from_static(b"stale"),
+            Bytes::from_static(b"\r"),
+            std::time::Duration::from_millis(1),
+        );
+        assert!(matches!(
+            stale,
+            Err(crate::terminal::ConditionalInputError::TokenMismatch)
+        ));
+        assert!(rx.try_recv().is_err());
+
+        let completion = runtime
+            .queue_user_input_submission_if(
+                1,
+                Bytes::from_static(b"conditional"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::from_millis(1),
+            )
+            .unwrap();
+        assert_eq!(runtime.input_submission_token(), 2);
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"conditional"));
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"\r"));
+        completion.recv().unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn focus_events_are_forwarded_when_enabled() {
         let (tx, mut rx) = mpsc::channel(4);
         let (resize_tx, _resize_rx) = watch::channel((80, 24, 0, 0));
@@ -5430,6 +5613,7 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
+            input_submission_gate: Arc::new(InputSubmissionGate::default()),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
@@ -5470,6 +5654,7 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
+            input_submission_gate: Arc::new(InputSubmissionGate::default()),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),

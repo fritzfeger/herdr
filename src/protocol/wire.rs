@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -1595,7 +1595,7 @@ pub(crate) fn modifier_with_underline_style(
 
 /// Converts a u16 back to a ratatui `Modifier`.
 fn u16_to_modifier(val: u16) -> ratatui::style::Modifier {
-    ratatui::style::Modifier::from_bits_truncate(val & !UNDERLINE_STYLE_MASK)
+    ratatui::style::Modifier::from_bits_retain(val)
 }
 
 // ---------------------------------------------------------------------------
